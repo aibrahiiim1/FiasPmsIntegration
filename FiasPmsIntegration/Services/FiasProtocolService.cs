@@ -29,19 +29,37 @@ namespace FiasPmsIntegration.Services
                 if (string.IsNullOrWhiteSpace(cleanMessage))
                     return null;
 
-                // Check for LRC (last character)
-                if (cleanMessage.Length > 1)
+                // Check if there's an LRC byte at the end (character after ETX in raw message)
+                // LRC is optional in some FIAS implementations
+                var hasLrc = rawMessage.Length > 2 &&
+                            rawMessage.IndexOf(ETX) >= 0 &&
+                            rawMessage.IndexOf(ETX) < rawMessage.Length - 1;
+
+                if (hasLrc && cleanMessage.Length > 0)
                 {
-                    var lrc = cleanMessage[^1];
-                    var dataWithoutLrc = cleanMessage[..^1];
-
-                    // Validate LRC
-                    if (!ValidateLRC(dataWithoutLrc, lrc))
+                    // Try to get LRC from the raw message (after ETX)
+                    var etxIndex = rawMessage.IndexOf(ETX);
+                    if (etxIndex < rawMessage.Length - 1)
                     {
-                        _logService.Log("WARN", "LRC validation failed");
-                    }
+                        var lrc = rawMessage[etxIndex + 1];
 
-                    cleanMessage = dataWithoutLrc;
+                        // Only validate if LRC is a printable character or control character
+                        if (lrc >= 0x00 && lrc <= 0xFF)
+                        {
+                            if (!ValidateLRC(cleanMessage, lrc))
+                            {
+                                _logService.Log("WARN", "LRC validation failed", $"Expected LRC for: {cleanMessage}");
+                            }
+                            else
+                            {
+                                _logService.Log("DEBUG", "LRC validation passed");
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    _logService.Log("DEBUG", "No LRC present (this is normal for some PMS systems)");
                 }
 
                 var fields = cleanMessage.Split(FIELD_SEPARATOR);
@@ -63,6 +81,8 @@ namespace FiasPmsIntegration.Services
                         var fieldId = fields[i].Substring(0, 2);
                         var fieldValue = fields[i].Length > 2 ? fields[i].Substring(2) : string.Empty;
                         message.Fields[fieldId] = fieldValue;
+
+                        _logService.Log("DEBUG", $"Parsed field: {fieldId} = {fieldValue}");
                     }
                 }
 
@@ -233,32 +253,75 @@ namespace FiasPmsIntegration.Services
         // Handle Guest Check-in
         private string? HandleGuestCheckIn(FiasMessage message)
         {
-            var guest = new GuestData
+            try
             {
-                RoomNumber = message.GetField("RN"),
-                ReservationNumber = message.GetField("G#"),
-                GuestName = message.GetField("GN"),
-                Language = message.GetField("GL"),
-                Status = "checked-in"
-            };
+                var roomNumber = message.GetField("RN");
+                var reservationNumber = message.GetField("G#");
+                var guestName = message.GetField("GN");
+                var language = message.GetField("GL");
+                var arrivalStr = message.GetField("GA");
+                var departureStr = message.GetField("GD");
+                var vipStatus = message.GetField("GV");
 
-            // Parse dates
-            if (DateTime.TryParseExact(message.GetField("GA"), "yyMMdd",
-                null, System.Globalization.DateTimeStyles.None, out var arrivalDate))
-            {
-                guest.ArrivalDate = arrivalDate;
+                _logService.Log("INFO", $"Check-in data - RN:{roomNumber}, G#:{reservationNumber}, GN:{guestName}, GA:{arrivalStr}, GD:{departureStr}");
+
+                // Validate required fields
+                if (string.IsNullOrEmpty(roomNumber) || string.IsNullOrEmpty(reservationNumber))
+                {
+                    _logService.Log("WARN", "Missing required fields for guest check-in");
+                    return null;
+                }
+
+                var guest = new GuestData
+                {
+                    RoomNumber = roomNumber,
+                    ReservationNumber = reservationNumber,
+                    GuestName = string.IsNullOrEmpty(guestName) ? "Unknown Guest" : guestName,
+                    Language = language,
+                    Status = "checked-in"
+                };
+
+                // Parse dates - FIAS format is YYMMDD
+                if (!string.IsNullOrEmpty(arrivalStr) && arrivalStr.Length == 6)
+                {
+                    if (DateTime.TryParseExact(arrivalStr, "yyMMdd",
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.None, out var arrivalDate))
+                    {
+                        guest.ArrivalDate = arrivalDate;
+                        _logService.Log("DEBUG", $"Parsed arrival date: {arrivalDate:yyyy-MM-dd}");
+                    }
+                    else
+                    {
+                        _logService.Log("WARN", $"Failed to parse arrival date: {arrivalStr}");
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(departureStr) && departureStr.Length == 6)
+                {
+                    if (DateTime.TryParseExact(departureStr, "yyMMdd",
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        System.Globalization.DateTimeStyles.None, out var departureDate))
+                    {
+                        guest.DepartureDate = departureDate;
+                        _logService.Log("DEBUG", $"Parsed departure date: {departureDate:yyyy-MM-dd}");
+                    }
+                    else
+                    {
+                        _logService.Log("WARN", $"Failed to parse departure date: {departureStr}");
+                    }
+                }
+
+                _guestStore.AddOrUpdateGuest(guest);
+                _logService.Log("INFO", $"✓ Guest checked in: {guest.GuestName} - Room {guest.RoomNumber} (Res# {guest.ReservationNumber})");
+
+                return null; // No response required
             }
-
-            if (DateTime.TryParseExact(message.GetField("GD"), "yyMMdd",
-                null, System.Globalization.DateTimeStyles.None, out var departureDate))
+            catch (Exception ex)
             {
-                guest.DepartureDate = departureDate;
+                _logService.Log("ERROR", $"Error in HandleGuestCheckIn: {ex.Message}");
+                return null;
             }
-
-            _guestStore.AddOrUpdateGuest(guest);
-            _logService.Log("INFO", $"Guest checked in: {guest.GuestName} - Room {guest.RoomNumber}");
-
-            return null; // No response required
         }
 
         // Handle Guest Check-out
@@ -267,8 +330,17 @@ namespace FiasPmsIntegration.Services
             var roomNumber = message.GetField("RN");
             var reservationNumber = message.GetField("G#");
 
-            _guestStore.RemoveGuest(reservationNumber);
-            _logService.Log("INFO", $"Guest checked out: Reservation {reservationNumber}");
+            _logService.Log("INFO", $"Check-out - RN:{roomNumber}, G#:{reservationNumber}");
+
+            if (!string.IsNullOrEmpty(reservationNumber))
+            {
+                _guestStore.RemoveGuest(reservationNumber);
+                _logService.Log("INFO", $"✓ Guest checked out: Reservation {reservationNumber}");
+            }
+            else
+            {
+                _logService.Log("WARN", "Check-out missing reservation number");
+            }
 
             return null;
         }
@@ -277,18 +349,37 @@ namespace FiasPmsIntegration.Services
         private string? HandleGuestChange(FiasMessage message)
         {
             var reservationNumber = message.GetField("G#");
+
+            _logService.Log("INFO", $"Guest change for reservation: {reservationNumber}");
+
+            if (string.IsNullOrEmpty(reservationNumber))
+            {
+                _logService.Log("WARN", "Guest change missing reservation number");
+                return null;
+            }
+
             var guest = _guestStore.GetGuest(reservationNumber);
 
             if (guest != null)
             {
                 // Update guest data
-                if (message.Fields.ContainsKey("RN"))
-                    guest.RoomNumber = message.GetField("RN");
-                if (message.Fields.ContainsKey("GN"))
-                    guest.GuestName = message.GetField("GN");
+                var roomNumber = message.GetField("RN");
+                var guestName = message.GetField("GN");
+                var language = message.GetField("GL");
+
+                if (!string.IsNullOrEmpty(roomNumber))
+                    guest.RoomNumber = roomNumber;
+                if (!string.IsNullOrEmpty(guestName))
+                    guest.GuestName = guestName;
+                if (!string.IsNullOrEmpty(language))
+                    guest.Language = language;
 
                 guest.LastUpdate = DateTime.Now;
-                _logService.Log("INFO", $"Guest updated: {guest.GuestName}");
+                _logService.Log("INFO", $"✓ Guest updated: {guest.GuestName}");
+            }
+            else
+            {
+                _logService.Log("WARN", $"Guest not found for update: {reservationNumber}");
             }
 
             return null;
@@ -399,7 +490,5 @@ namespace FiasPmsIntegration.Services
 
             return BuildMessage("PA", paFields);
         }
-
-
     }
 }
